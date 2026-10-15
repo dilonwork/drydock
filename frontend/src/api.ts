@@ -106,6 +106,11 @@ export const api = {
   updateUser: (id: string, data: { password?: string; role?: string }) =>
     req<UserItem>(`/api/users/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteUser: (id: string) => req<{ ok: boolean }>(`/api/users/${id}`, { method: 'DELETE' }),
+  listAudit: (params?: { limit?: number; offset?: number; action?: string }) =>
+    req<{ total: number; entries: AuditEntry[] }>(
+      '/api/audit?' + new URLSearchParams(
+        Object.entries(params || {}).filter(([, v]) => v !== undefined && v !== '')
+          .map(([k, v]) => [k, String(v)] as [string, string])).toString()),
 
   listHosts: () => req<Host[]>('/api/hosts'),
   addHost: (data: { name: string; address: string; port: number; username: string; private_key: string }) =>
@@ -234,6 +239,16 @@ export interface UserItem {
   username: string
   role: string
   created_at: number
+}
+
+export interface AuditEntry {
+  id: string
+  ts: number
+  username: string
+  action: string
+  resource_type: string | null
+  resource_id: string | null
+  detail: string | null
 }
 
 export interface NotifyChannel {

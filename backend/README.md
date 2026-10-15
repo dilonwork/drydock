@@ -53,6 +53,18 @@ late WebSocket joiners get the full replay from the database.
 - Admin user management: `GET/POST /api/users`, `PATCH /api/users/{id}` (role, password), `DELETE /api/users/{id}`; last admin can't be demoted or deleted; password change kills other sessions
 - Passwords are bcrypt-hashed; tokens are opaque, revocable, 30-day expiry
 
+### Audit log
+
+- Every state-changing API call records one row: acting user, action
+  (e.g. `job.create`, `auth.login_failed`), affected resource, timestamp,
+  and a short detail. Reads are never logged.
+- `GET /api/audit` (admin only) → `{total, entries}` newest-first;
+  query params `limit` (default 100, max 1000), `offset`, `action`
+  (prefix filter, e.g. `action=job.`)
+- Username is denormalized so entries stay readable after an account is
+  deleted. Recording is best-effort and never breaks the API call.
+- Frontend: Audit log page under SYSTEM (admin only) with action filter.
+
 - `POST /api/hosts` {name, address, port, username, private_key} → add host (runs ssh-keyscan probe)
 - `GET /api/hosts` → host list (private key never returned)
 - `DELETE /api/hosts/{id}`

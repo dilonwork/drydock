@@ -13,6 +13,7 @@ import Playbooks from './pages/Playbooks'
 import Schedules from './pages/Schedules'
 import Templates from './pages/Templates'
 import Users from './pages/Users'
+import Audit from './pages/Audit'
 import Login, { Setup } from './pages/Login'
 import { api, clearToken, getToken } from './api'
 
@@ -88,6 +89,7 @@ export default function App() {
             <Route path="/notifications" element={<Notifications />} />
             <Route path="/clusters" element={<Clusters />} />
             <Route path="/users" element={<AdminOnly><Users /></AdminOnly>} />
+            <Route path="/audit" element={<AdminOnly><Audit /></AdminOnly>} />
           </Route>
         </Routes>
       </AuthGate>

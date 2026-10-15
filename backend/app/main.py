@@ -24,13 +24,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import auth as auth_mod
+from . import audit as audit_mod
 from . import events
 from .celery_app import celery
 from .db import init_db, session_scope
 from .crypto import decrypt_str, encrypt_str
 from .launch import PING_YML, launch_job, template_snapshot
-from .models import (Host, Job, MaintenanceRun, NotificationChannel, Playbook,
-                     Schedule, Session, Template, Cluster, User)
+from .models import (AuditLog, Host, Job, MaintenanceRun, NotificationChannel,
+                     Playbook, Schedule, Session, Template, Cluster, User)
 from .runner_service import syntax_check_playbook
 from .schedules import (count_missed, describe_cron, next_occurrence,
                         preview_next, validate_cron, validate_timezone)
@@ -207,6 +208,8 @@ def auth_setup(body: AuthIn):
     except ValueError as e:
         raise HTTPException(400, str(e))
     token = auth_mod.create_session(u.id)
+    audit_mod.record(u, "auth.setup", "user", u.id,
+                     f"first admin '{u.username}' created")
     return {"token": token, "username": u.username, "role": u.role}
 
 
@@ -215,17 +218,23 @@ def auth_login(body: AuthIn):
     with session_scope() as s:
         u = s.query(User).filter_by(username=body.username.strip()).first()
         if not u or not auth_mod.verify_password(body.password, u.password_hash):
+            audit_mod.record(None, "auth.login_failed",
+                             username=body.username.strip() or "?",
+                             detail="invalid username or password")
             raise HTTPException(401, "invalid username or password")
         uid = u.id
     token = auth_mod.create_session(uid)
     with session_scope() as s:
         u = s.get(User, uid)
+        audit_mod.record(u, "auth.login", detail="login ok")
         return {"token": token, "username": u.username, "role": u.role}
 
 
 @app.post("/api/auth/logout")
 def auth_logout(request: Request):
+    u = getattr(request.state, "user", None)
     auth_mod.revoke_token(_bearer_token(request))
+    audit_mod.record(u, "auth.logout")
     return {"ok": True}
 
 
@@ -245,11 +254,13 @@ def list_users(request: Request):
 
 @app.post("/api/users")
 def create_user(body: UserIn, request: Request):
-    _require_admin(request)
+    me = _require_admin(request)
     try:
         u = auth_mod.create_user(body.username, body.password, body.role)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    audit_mod.record(me, "user.create", "user", u.id,
+                     f"'{u.username}' created as {u.role}")
     return auth_mod.public_user(u)
 
 
@@ -266,6 +277,10 @@ def update_user(uid: str, body: UserPatch, request: Request):
             if u.role == "admin" and body.role != "admin" \
                     and auth_mod.admin_count() <= 1:
                 raise HTTPException(400, "cannot demote the last admin")
+            if u.role != body.role:
+                audit_mod.record(me, "user.role_change", "user", u.id,
+                                 f"'{u.username}': {u.role} -> {body.role}",
+                                 session=s)
             u.role = body.role
         if body.password is not None:
             try:
@@ -276,6 +291,8 @@ def update_user(uid: str, body: UserPatch, request: Request):
             # changing a password kills all other sessions
             s.query(Session).filter(Session.user_id == u.id,
                                     Session.token != _bearer_token(request)).delete()
+            audit_mod.record(me, "user.password_reset", "user", u.id,
+                             f"password reset for '{u.username}'", session=s)
         return auth_mod.public_user(u)
 
 
@@ -291,13 +308,33 @@ def delete_user(uid: str, request: Request):
         if u.role == "admin" and auth_mod.admin_count() <= 1:
             raise HTTPException(400, "cannot delete the last admin")
         s.query(Session).filter_by(user_id=uid).delete()
+        audit_mod.record(me, "user.delete", "user", uid,
+                         f"'{u.username}' ({u.role}) deleted", session=s)
         s.delete(u)
     return {"ok": True}
 
 
+# ---------- audit log ----------
+@app.get("/api/audit")
+def list_audit(request: Request, limit: int = 100, offset: int = 0,
+               action: str | None = None):
+    """Newest-first audit entries. Admin only."""
+    _require_admin(request)
+    limit = max(1, min(limit, 1000))
+    offset = max(0, offset)
+    with session_scope() as s:
+        q = s.query(AuditLog)
+        if action:
+            q = q.filter(AuditLog.action.like(f"{action}%"))
+        total = q.count()
+        rows = q.order_by(AuditLog.ts.desc()).offset(offset).limit(limit).all()
+        return {"total": total,
+                "entries": [audit_mod.public_entry(e) for e in rows]}
+
+
 # ---------- hosts ----------
 @app.post("/api/hosts")
-def add_host(h: HostIn):
+def add_host(h: HostIn, request: Request):
     try:
         host_key = keyscan(h.address, h.port)
     except Exception as e:
@@ -307,6 +344,8 @@ def add_host(h: HostIn):
         s.add(Host(id=hid, name=h.name, address=h.address, port=h.port,
                    username=h.username, private_key=encrypt_str(h.private_key),
                    host_key=host_key, added_at=time.time()))
+    audit_mod.record(request.state.user, "host.create", "host", hid,
+                     f"'{h.name}' ({h.address}:{h.port})")
     return {"id": hid, "name": h.name, "address": h.address}
 
 
@@ -317,23 +356,27 @@ def list_hosts():
 
 
 @app.delete("/api/hosts/{hid}")
-def del_host(hid: str):
+def del_host(hid: str, request: Request):
     with session_scope() as s:
         h = s.get(Host, hid)
         if h:
+            audit_mod.record(request.state.user, "host.delete", "host", hid,
+                             f"'{h.name}' deleted", session=s)
             s.delete(h)
     return {"ok": True}
 
 
 # ---------- playbooks ----------
 @app.post("/api/playbooks")
-def add_playbook(p: PlaybookIn):
+def add_playbook(p: PlaybookIn, request: Request):
     if not p.content.strip():
         raise HTTPException(400, "playbook content is empty")
     pid = uuid.uuid4().hex[:8]
     with session_scope() as s:
         s.add(Playbook(id=pid, name=p.name, content=p.content,
                        created_at=time.time()))
+    audit_mod.record(request.state.user, "playbook.create", "playbook", pid,
+                     f"'{p.name}' registered")
     return {"id": pid}
 
 
@@ -355,7 +398,7 @@ def get_playbook(pid: str):
 
 
 @app.delete("/api/playbooks/{pid}")
-def del_playbook(pid: str):
+def del_playbook(pid: str, request: Request):
     with session_scope() as s:
         used_by = [t.name for t in s.query(Template).all()
                    if t.playbook_id == pid]
@@ -363,6 +406,9 @@ def del_playbook(pid: str):
             raise HTTPException(400, f"playbook is used by templates: {used_by}")
         p = s.get(Playbook, pid)
         if p:
+            audit_mod.record(request.state.user, "playbook.delete",
+                             "playbook", pid, f"'{p.name}' deleted",
+                             session=s)
             s.delete(p)
     return {"ok": True}
 
@@ -380,7 +426,7 @@ def playbook_syntax_check(pid: str):
 
 # ---------- job templates ----------
 @app.post("/api/templates")
-def add_template(t: TemplateIn):
+def add_template(t: TemplateIn, request: Request):
     if t.notification_policy not in ("always", "failure_only", "never"):
         raise HTTPException(400, "notification_policy must be always|failure_only|never")
     with session_scope() as s:
@@ -396,6 +442,8 @@ def add_template(t: TemplateIn):
                        check_mode=t.check_mode,
                        notification_policy=t.notification_policy,
                        created_at=time.time()))
+    audit_mod.record(request.state.user, "template.create", "template", tid,
+                     f"'{t.name}' on {len(t.host_ids)} host(s)")
     return {"id": tid}
 
 
@@ -415,17 +463,20 @@ def list_templates():
 
 
 @app.delete("/api/templates/{tid}")
-def del_template(tid: str):
+def del_template(tid: str, request: Request):
     with session_scope() as s:
         t = s.get(Template, tid)
         if t:
+            audit_mod.record(request.state.user, "template.delete",
+                             "template", tid, f"'{t.name}' deleted",
+                             session=s)
             s.delete(t)
     return {"ok": True}
 
 
 # ---------- jobs ----------
 @app.post("/api/jobs")
-def create_job(j: JobIn):
+def create_job(j: JobIn, request: Request):
     if bool(j.template_id) == bool(j.host_ids):
         raise HTTPException(400, "provide either template_id or host_ids")
 
@@ -449,7 +500,11 @@ def create_job(j: JobIn):
                 "extra_vars": j.extra_vars or {},
                 "check_mode": False,
             }
-    return {"job_id": launch_job(snapshot)}
+    jid = launch_job(snapshot)
+    audit_mod.record(request.state.user, "job.create", "job", jid,
+                     f"'{snapshot.get('playbook_name')}' on "
+                     f"{len(snapshot.get('host_ids', []))} host(s)")
+    return {"job_id": jid}
 
 
 @app.get("/api/jobs")
@@ -468,7 +523,7 @@ def get_job(jid: str):
 
 
 @app.post("/api/jobs/{jid}/cancel")
-def cancel_job(jid: str):
+def cancel_job(jid: str, request: Request):
     with session_scope() as s:
         job = s.get(Job, jid)
         if not job:
@@ -505,11 +560,12 @@ def cancel_job(jid: str):
         raise HTTPException(400, "job already finished")
     events.emit_event(jid, {"type": "job_cancelled",
                             "ts": round(time.time(), 2)})
+    audit_mod.record(request.state.user, "job.cancel", "job", jid)
     return {"ok": True}
 
 
 @app.post("/api/jobs/{jid}/retry")
-def retry_job(jid: str):
+def retry_job(jid: str, request: Request):
     with session_scope() as s:
         job = s.get(Job, jid)
         if not job:
@@ -528,7 +584,10 @@ def retry_job(jid: str):
         raise HTTPException(400, "no failed hosts to retry")
     snapshot["host_ids"] = failed_ids
     snapshot["retried_from"] = jid
-    return {"job_id": launch_job(snapshot)}
+    new_jid = launch_job(snapshot)
+    audit_mod.record(request.state.user, "job.retry", "job", new_jid,
+                     f"retried from {jid}")
+    return {"job_id": new_jid}
 
 
 # ---------- maintenance runs (M5) ----------
@@ -579,7 +638,7 @@ def _enqueue_maintenance(rid: str) -> None:
 
 
 @app.post("/api/maintenance")
-def create_maintenance(m: MaintenanceIn):
+def create_maintenance(m: MaintenanceIn, request: Request):
     if m.workflow not in WORKFLOWS:
         raise HTTPException(400, f"unknown workflow: {m.workflow}")
     if not m.node_ids:
@@ -602,6 +661,9 @@ def create_maintenance(m: MaintenanceIn):
             created_at=time.time(), finished_at=None))
     events.ws_queues[rid] = []
     _enqueue_maintenance(rid)
+    audit_mod.record(request.state.user, "maintenance.create",
+                     "maintenance", rid,
+                     f"'{m.name}' ({m.workflow}) on {len(m.node_ids)} node(s)")
     return {"run_id": rid}
 
 
@@ -617,24 +679,28 @@ def get_maintenance(rid: str):
 
 
 @app.post("/api/maintenance/{rid}/pause")
-def pause_maintenance(rid: str):
+def pause_maintenance(rid: str, request: Request):
     _get_maint_or_404(rid)
     if not _maint_transition(rid, ("running",), "pausing"):
         raise HTTPException(400, "run is not running")
+    audit_mod.record(request.state.user, "maintenance.pause",
+                     "maintenance", rid)
     return {"ok": True}
 
 
 @app.post("/api/maintenance/{rid}/resume")
-def resume_maintenance(rid: str):
+def resume_maintenance(rid: str, request: Request):
     _get_maint_or_404(rid)
     if not _maint_transition(rid, ("paused", "pausing"), "running"):
         raise HTTPException(400, "run is not paused")
     _enqueue_maintenance(rid)
+    audit_mod.record(request.state.user, "maintenance.resume",
+                     "maintenance", rid)
     return {"ok": True}
 
 
 @app.post("/api/maintenance/{rid}/retry-node")
-def retry_maintenance_node(rid: str):
+def retry_maintenance_node(rid: str, request: Request):
     run = _get_maint_or_404(rid)
     if run.status != "paused":
         raise HTTPException(400, f"run is not paused (status={run.status})")
@@ -654,11 +720,14 @@ def retry_maintenance_node(rid: str):
     if not _maint_transition(rid, ("paused",), "running"):
         raise HTTPException(400, "run is not paused")
     _enqueue_maintenance(rid)
+    audit_mod.record(request.state.user, "maintenance.retry_node",
+                     "maintenance", rid,
+                     f"node '{node['node_name']}' retried")
     return {"ok": True}
 
 
 @app.post("/api/maintenance/{rid}/skip-node")
-def skip_maintenance_node(rid: str):
+def skip_maintenance_node(rid: str, request: Request):
     run = _get_maint_or_404(rid)
     if run.status != "paused":
         raise HTTPException(400, f"run is not paused (status={run.status})")
@@ -675,11 +744,14 @@ def skip_maintenance_node(rid: str):
     if not _maint_transition(rid, ("paused",), "running"):
         raise HTTPException(400, "run is not paused")
     _enqueue_maintenance(rid)
+    audit_mod.record(request.state.user, "maintenance.skip_node",
+                     "maintenance", rid,
+                     f"node '{node['node_name']}' skipped")
     return {"ok": True}
 
 
 @app.post("/api/maintenance/{rid}/abort")
-def abort_maintenance(rid: str):
+def abort_maintenance(rid: str, request: Request):
     run = _get_maint_or_404(rid)
     if run.status not in ("running", "pausing", "paused"):
         raise HTTPException(400, f"run is not active (status={run.status})")
@@ -707,6 +779,8 @@ def abort_maintenance(rid: str):
         raise HTTPException(400, "run already finished")
     events.emit_run_event(rid, {"type": "maint_aborted",
                                 "ts": round(time.time(), 2)})
+    audit_mod.record(request.state.user, "maintenance.abort",
+                     "maintenance", rid)
     return {"ok": True}
 
 
@@ -775,7 +849,7 @@ def preview_schedule(p: SchedulePreviewIn):
 
 
 @app.post("/api/schedules")
-def create_schedule(sch: ScheduleIn):
+def create_schedule(sch: ScheduleIn, request: Request):
     _check_cron_tz(sch.cron, sch.timezone)
     with session_scope() as s:
         if not s.get(Template, sch.template_id):
@@ -790,6 +864,8 @@ def create_schedule(sch: ScheduleIn):
             next_run_at=next_occurrence(sch.cron, sch.timezone, now)
             if sch.enabled else None,
             created_at=now))
+    audit_mod.record(request.state.user, "schedule.create", "schedule", sid,
+                     f"'{sch.name}' ({sch.cron} {sch.timezone})")
     return {"schedule_id": sid}
 
 
@@ -818,7 +894,7 @@ def get_schedule(sid: str):
 
 
 @app.put("/api/schedules/{sid}")
-def update_schedule(sid: str, sch: ScheduleIn):
+def update_schedule(sid: str, sch: ScheduleIn, request: Request):
     _check_cron_tz(sch.cron, sch.timezone)
     with session_scope() as s:
         r = s.get(Schedule, sid)
@@ -840,21 +916,25 @@ def update_schedule(sid: str, sch: ScheduleIn):
             r.next_run_at = None
         elif cadence_changed:
             r.next_run_at = next_occurrence(sch.cron, sch.timezone, time.time())
+    audit_mod.record(request.state.user, "schedule.update", "schedule", sid,
+                     f"'{sch.name}' updated")
     return {"ok": True}
 
 
 @app.delete("/api/schedules/{sid}")
-def delete_schedule(sid: str):
+def delete_schedule(sid: str, request: Request):
     with session_scope() as s:
         r = s.get(Schedule, sid)
         if not r:
             raise HTTPException(404, "no such schedule")
+        audit_mod.record(request.state.user, "schedule.delete", "schedule",
+                         sid, f"'{r.name}' deleted", session=s)
         s.delete(r)
     return {"ok": True}
 
 
 @app.post("/api/schedules/{sid}/run-now")
-def run_schedule_now(sid: str):
+def run_schedule_now(sid: str, request: Request):
     with session_scope() as s:
         r = s.get(Schedule, sid)
         if not r:
@@ -869,6 +949,8 @@ def run_schedule_now(sid: str):
         r.last_run_at = time.time()
         r.last_job_id = jid
         r.last_status = "launched (manual)"
+    audit_mod.record(request.state.user, "schedule.run_now", "schedule", sid,
+                     f"manual run of '{r.name}' -> job {jid}")
     return {"job_id": jid}
 
 
@@ -893,7 +975,7 @@ def list_channels():
 
 
 @app.post("/api/notification-channels")
-def add_channel(ch: ChannelIn):
+def add_channel(ch: ChannelIn, request: Request):
     if ch.type != "webhook":
         raise HTTPException(400, "only 'webhook' channels are supported for now")
     if not (ch.config or {}).get("url"):
@@ -903,20 +985,25 @@ def add_channel(ch: ChannelIn):
         s.add(NotificationChannel(id=cid, name=ch.name, type=ch.type,
                                   config=dict(ch.config), enabled=ch.enabled,
                                   created_at=time.time()))
+    audit_mod.record(request.state.user, "channel.create",
+                     "notification_channel", cid, f"'{ch.name}' ({ch.type})")
     return {"id": cid}
 
 
 @app.delete("/api/notification-channels/{cid}")
-def delete_channel(cid: str):
+def delete_channel(cid: str, request: Request):
     with session_scope() as s:
         c = s.get(NotificationChannel, cid)
         if c:
+            audit_mod.record(request.state.user, "channel.delete",
+                             "notification_channel", cid,
+                             f"'{c.name}' deleted", session=s)
             s.delete(c)
     return {"ok": True}
 
 
 @app.post("/api/notification-channels/{cid}/test")
-def test_channel(cid: str):
+def test_channel(cid: str, request: Request):
     """Send a test payload to the channel; returns what the endpoint said."""
     import urllib.request, urllib.error, json as _json
     with session_scope() as s:
@@ -925,6 +1012,7 @@ def test_channel(cid: str):
             raise HTTPException(404, "no such channel")
         url = (c.config or {}).get("url")
         headers = (c.config or {}).get("headers", {})
+        cname = c.name
     payload = {"event": "test", "message": "Drydock test notification",
                "link": "/"}
     try:
@@ -932,6 +1020,9 @@ def test_channel(cid: str):
             url, data=_json.dumps(payload).encode(), method="POST",
             headers={"Content-Type": "application/json", **headers})
         with urllib.request.urlopen(req, timeout=15) as resp:
+            audit_mod.record(request.state.user, "channel.test",
+                             "notification_channel", cid,
+                             f"test notification sent to '{cname}'")
             return {"ok": True, "status": resp.status}
     except urllib.error.HTTPError as e:
         raise HTTPException(400, f"webhook returned HTTP {e.code}")
@@ -953,7 +1044,7 @@ def _cluster_public(c: Cluster) -> dict:
 
 
 @app.post("/api/clusters")
-def add_cluster(c: ClusterIn):
+def add_cluster(c: ClusterIn, request: Request):
     if not c.kubeconfig.strip():
         raise HTTPException(400, "kubeconfig is empty")
     try:
@@ -972,6 +1063,8 @@ def add_cluster(c: ClusterIn):
                       k8s_version=result.get("k8s_version"),
                       status="ok", last_error=None,
                       last_sync_at=now, created_at=now))
+    audit_mod.record(request.state.user, "cluster.create", "cluster", cid,
+                     f"'{c.name}' onboarded ({result['server']})")
     return {"id": cid, "server": result["server"],
             "k8s_version": result.get("k8s_version")}
 
@@ -996,9 +1089,11 @@ def get_cluster(cid: str):
 
 
 @app.delete("/api/clusters/{cid}")
-def delete_cluster(cid: str):
+def delete_cluster(cid: str, request: Request):
     with session_scope() as s:
         c = _get_cluster_or_404(s, cid)
+        audit_mod.record(request.state.user, "cluster.delete", "cluster",
+                         cid, f"'{c.name}' removed", session=s)
         s.delete(c)
     return {"ok": True}
 

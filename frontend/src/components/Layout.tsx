@@ -52,9 +52,14 @@ export default function Layout() {
         <div className="nav-sec">SYSTEM</div>
         <nav className="nav">
           {me?.role === 'admin' && (
-            <NavLink to="/users" className={({isActive}) => isActive ? 'active' : ''}>
-              <span className="ico">👥</span>Users
-            </NavLink>
+            <>
+              <NavLink to="/users" className={({isActive}) => isActive ? 'active' : ''}>
+                <span className="ico">👥</span>Users
+              </NavLink>
+              <NavLink to="/audit" className={({isActive}) => isActive ? 'active' : ''}>
+                <span className="ico">📝</span>Audit log
+              </NavLink>
+            </>
           )}
           <a href="#" onClick={e => e.preventDefault()} title="Coming later">
             <span className="ico">🔑</span>Credentials

@@ -146,3 +146,20 @@ class Session(Base):
     user_id = Column(String(16), nullable=False)
     created_at = Column(Float)
     expires_at = Column(Float)
+
+
+class AuditLog(Base):
+    """Append-only audit trail: who did what, when.
+
+    username is denormalized so entries stay readable after the account
+    is deleted. Reads are never logged; only state-changing calls are.
+    """
+    __tablename__ = "audit_log"
+    id = Column(String(16), primary_key=True)
+    ts = Column(Float, nullable=False)
+    user_id = Column(String(16), nullable=True)  # null when unknown (failed login)
+    username = Column(String(64), nullable=False)
+    action = Column(String(64), nullable=False)  # e.g. "job.create"
+    resource_type = Column(String(32), nullable=True)  # e.g. "job"
+    resource_id = Column(String(64), nullable=True)
+    detail = Column(Text, nullable=True)
