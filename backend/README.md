@@ -33,7 +33,7 @@ E2E smoke (needs a local sshd): `./scripts/e2e_smoke.sh` from the repo root.
 
 SQLAlchemy. `DATABASE_URL` selects the backend:
 
-- `postgresql://ansible_gui:ansible_gui@postgres:5432/ansible_gui` (docker compose)
+- `postgresql+psycopg2://ansible_gui:ansible_gui@postgres:5432/ansible_gui` (docker compose; driver pinned explicitly — SQLAlchemy 2.0 resolves a bare postgres URL to psycopg v3, which is not installed)
 - `sqlite:///./ansible_gui.db` (local dev default when the env var is unset)
 - tests point it at a temp SQLite file
 

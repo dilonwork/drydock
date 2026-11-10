@@ -18,7 +18,7 @@ services:
   backend:
     build: ./backend
     environment:
-      DATABASE_URL: postgresql://ansible_gui:ansible_gui@postgres:5432/ansible_gui
+      DATABASE_URL: postgresql+psycopg2://ansible_gui:ansible_gui@postgres:5432/ansible_gui
       REDIS_URL: redis://redis:6379/0
       # skeleton dev key; production must inject this from a secret manager (M7)
       ENCRYPTION_KEY: PPdr9t6K2PHDNDuctrDgSR0ZhW3I1QotZiVnFNFuvyc=
@@ -34,7 +34,7 @@ services:
     build: ./backend
     command: celery -A app.celery_app worker --loglevel=info --concurrency=4
     environment:
-      DATABASE_URL: postgresql://ansible_gui:ansible_gui@postgres:5432/ansible_gui
+      DATABASE_URL: postgresql+psycopg2://ansible_gui:ansible_gui@postgres:5432/ansible_gui
       REDIS_URL: redis://redis:6379/0
       ENCRYPTION_KEY: PPdr9t6K2PHDNDuctrDgSR0ZhW3I1QotZiVnFNFuvyc=
     depends_on:
@@ -45,7 +45,7 @@ services:
     build: ./backend
     command: celery -A app.celery_app beat --loglevel=info
     environment:
-      DATABASE_URL: postgresql://ansible_gui:ansible_gui@postgres:5432/ansible_gui
+      DATABASE_URL: postgresql+psycopg2://ansible_gui:ansible_gui@postgres:5432/ansible_gui
       REDIS_URL: redis://redis:6379/0
       ENCRYPTION_KEY: PPdr9t6K2PHDNDuctrDgSR0ZhW3I1QotZiVnFNFuvyc=
     depends_on:

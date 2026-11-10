@@ -1,9 +1,14 @@
 """Database setup: SQLAlchemy engine + session handling.
 
 DATABASE_URL selects the backend:
-- postgresql://user:pass@host/db   (docker compose)
+- postgresql+psycopg2://user:pass@host/db   (docker compose)
 - sqlite:///./ansible_gui.db        (local dev default)
 - tests point it at a temp SQLite file via the env var
+
+NOTE: the driver must be pinned explicitly. SQLAlchemy 2.0 resolves a bare
+postgres URL to psycopg (v3), which is not installed; requirements only
+provide psycopg2-binary. A bare URL makes the backend crash on startup with
+ModuleNotFoundError: No module named 'psycopg'.
 """
 import os
 from contextlib import contextmanager
